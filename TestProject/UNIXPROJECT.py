@@ -1,122 +1,148 @@
-from gpiozero import LED,MotionSensor
-import numpy as np
 import cv2
-import time
+import numpy as np
 import os
-# Set up libraries and overall settings
-import RPi.GPIO as GPIO  # Imports the standard Raspberry Pi GPIO library
-from time import sleep   # Imports sleep (aka wait or pause) into the program
-GPIO.setmode(GPIO.BOARD) # Sets the pin numbering system to use the physical layout
+from gpiozero import MotionSensor, Servo
+import time
+import threading  # Import threading to handle servo movement timing independently
+from rpi_lcd import LCD  # Importing LCD from rpi_lcd
 
-# Set up pin 27 for PWM
-GPIO.setup(11,GPIO.OUT)  # Sets up pin 11 to an output (instead of an input)
-p = GPIO.PWM(11, 50)     # Sets up pin 11 as a PWM pin
-p.start(0)               # Starts running PWM on the pin and sets it to 0
-
-video = cv2.VideoCapture(0)
-
-#GPIO PIN 
+# GPIO PIN for Motion Sensor and Servo
 sensorPin = 17
-timeS = 0
+servoPin = 27  # Change this to the correct GPIO pin for your servo
+sensor = MotionSensor(sensorPin)
+
+# Initialize the servo
+servo = Servo(servoPin)
+
+# Initialize the LCD
+lcd = LCD()
+
+# Clear the LCD screen
+lcd.clear()
 
 # Load OpenCV face detector
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
 
 # Function to compare two images using histogram comparison
 def compare_images(image1, image2):
-    # Convert images to grayscale
     gray1 = cv2.cvtColor(image1, cv2.COLOR_BGR2GRAY)
     gray2 = cv2.cvtColor(image2, cv2.COLOR_BGR2GRAY)
     
-    # Compute histograms
     hist1 = cv2.calcHist([gray1], [0], None, [256], [0, 256])
     hist2 = cv2.calcHist([gray2], [0], None, [256], [0, 256])
     
-    # Normalize histograms
     cv2.normalize(hist1, hist1)
     cv2.normalize(hist2, hist2)
     
-    # Compare histograms using correlation method
     correlation = cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
     
-    # Return a match score (1 is perfect match)
     return correlation
 
-# Load the reference images from the folder
-image_folder =  "C:\\Users\\zachr\\OneDrive\\Desktop\\TestProject\\Knownfaces" # Change to your folder path
+# Load the reference images from subfolders within the folder
+image_folder = "/home/bert459/Downloads/UnixProject-main/TestProject/Knownfaces"  # Change to your folder path
 reference_images = []
-image_files = os.listdir(image_folder)
 
-for image_file in image_files:
-    image_path = os.path.join(image_folder, image_file)
-    if os.path.isfile(image_path):
-        img = cv2.imread(image_path)
-        reference_images.append((img, image_file))  # Store image with its filename
+# Walk through the folder and subfolders to read all images
+for root, dirs, files in os.walk(image_folder):
+    for image_file in files:
+        if image_file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            image_path = os.path.join(root, image_file)
+            img = cv2.imread(image_path)
+            folder_name = os.path.basename(root)  # Get the folder name where the image is located
+            reference_images.append((img, folder_name))  # Store image and folder name
 
 # Start capturing the live feed
 cap = cv2.VideoCapture(0)  # 0 is usually the default webcam
 
+# Variable to keep track of the camera feed state and the time limit
+camera_active = False
+start_time = None
 
-# Initialize background subtractor for motion detection
-fgbg = cv2.createBackgroundSubtractorMOG2()
+# Function to handle the servo sleeping for 5 seconds
+def move_servo_to_180():
+    servo.value = 1  # Move to 180 degrees
+    time.sleep(5)    # Wait for 5 seconds
+    servo.value = -1  # Return to 0 degrees
 
-
-#Determine if true or false for motion
-sensor = MotionSensor(sensorPin)
-currentstate = False
-#currentstate = sensor.motion_detected
+# Function to display folder name on LCD for 5 seconds
+def display_name_on_lcd(name):
+    lcd.clear()  # Clear the display
+    lcd.text(f"Welcome {name}!", 1)  # Display folder name on the first line of the LCD
+    time.sleep(5)  # Wait for 5 seconds
+    lcd.clear()  # Clear the display after 5 seconds
 
 while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+    # Wait for motion to be detected
+    sensor.wait_for_motion()
 
-    # Convert frame to grayscale for face detection
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # When motion is detected, start the camera feed for 20 seconds
+    camera_active = True
+    start_time = time.time()
 
-    # Detect faces in the frame
-    faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+    while camera_active:
+        ret, frame = cap.read()
+        if not ret:
+            break
 
-    # Draw rectangles around faces
-    for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        # Convert frame to grayscale for face detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Crop the face from the frame
-        face_roi = frame[y:y + h, x:x + w]
+        # Detect faces in the frame
+        faces = face_cascade.detectMultiScale(gray, 1.1, 4)
 
-        # Compare the cropped face with reference images
-        matched = False
-        for reference_image, filename in reference_images:
-            similarity = compare_images(face_roi, reference_image)
-            if similarity > 0.8:  # You can adjust the threshold for a better match
+        # Draw rectangles around faces and compare with reference images
+        matched = False  # Start with the assumption that no match is found
+        highest_similarity = 0  # To track the highest similarity
+        best_folder_name = ""  # To store the folder name with highest similarity
+
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+
+            # Crop the face from the frame
+            face_roi = frame[y:y + h, x:x + w]
+
+            # Compare the cropped face with reference images
+            for reference_image, folder_name in reference_images:
+                similarity = compare_images(face_roi, reference_image)
+                if similarity > highest_similarity:  # Track the highest similarity
+                    highest_similarity = similarity
+                    best_folder_name = folder_name
+
+            # If the highest similarity exceeds a threshold, perform actions
+            if highest_similarity > 0.6:  # You can adjust the threshold for a better match
                 matched = True
-                #cv2.putText(frame, f"Match!{filename}",(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                if(filename == "zach1.jpg" or filename == "zach2.jpg" or filename == "zach3.jpg"):
-                    cv2.putText(frame, f"Hi Zach!{filename}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                    p.ChangeDutyCycle(3)     # Changes the pulse width to 3 (so moves the servo)
-                    sleep(1)                 # Wait 1 second
-                    p.ChangeDutyCycle(12)    # Changes the pulse width to 12 (so moves the servo)
-                    sleep(1)
-                    break  # Stop searching once a match is found
-                if(filename == "asani2.jpg" or filename == "asani3.jpg" or filename == "asani4.jpg"):
-                    cv2.putText(frame, f"Hi Asani!{filename}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                # Start a separate thread to move the servo and display on LCD
+                threading.Thread(target=move_servo_to_180).start()
+                threading.Thread(target=display_name_on_lcd, args=(best_folder_name,)).start()
+                # Display the folder name (main folder) and similarity percentage on the frame
+                similarity_text = f"Similarity: {highest_similarity * 100:.2f}%"
+                cv2.putText(frame, f"Welcome {best_folder_name}!", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                cv2.putText(frame, similarity_text, (x, y - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                break
 
-                    break  # Stop searching once a match is found
-                if(filename == "makenna1.jpg" or filename == "makenna2.jpg" or filename == "makenna3.jpg" or filename == "makenna4.jpg" or filename == "makenna5.jpg" or filename == "makenna6.jpg"):
-                    cv2.putText(frame, f"Hi MaKenna!{filename}",(x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                    
-                    break  # Stop searching once a match is found
-
-        # If no match is found, display no match
+        # If no match is found, display the highest similarity found
         if not matched:
-            cv2.putText(frame, "No Match Found", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            similarity_text = f"Similarity: {highest_similarity * 100:.2f}%"
+            cv2.putText(frame, similarity_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-    # Display the live feed
-    cv2.imshow('Live Feed', frame)
+        # Display the live feed
+        cv2.imshow('Live Feed', frame)
 
-    # Press 'q' to exit the live feed
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        # Check if 20 seconds have passed or if 'q' is pressed to exit
+        if time.time() - start_time > 20:
+            camera_active = False  # Stop the camera feed after 20 seconds
+            # If no match was found in the entire period, reset the servo to 0 degrees
+            if not matched:
+                servo.value = -1  # Move back to 0 degrees
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Wait for motion again to trigger the camera
+    sensor.wait_for_motion()
+
+# Clear the LCD screen
+lcd.clear()
 
 # Release the capture and close any OpenCV windows
 cap.release()
